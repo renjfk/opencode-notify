@@ -13,6 +13,10 @@ question asked). The plugin adapts to whether your terminal window is visible
 and whether the Zellij tab is active, so you only get pinged when you would
 actually miss the event.
 
+|                 Zellij tab blinking                  |                     Desktop notification                      |
+| :--------------------------------------------------: | :-----------------------------------------------------------: |
+| ![Zellij tab blinking](screenshots/tab-blinking.gif) | ![Desktop notification](screenshots/desktop-notification.png) |
+
 ## Behavior
 
 When OpenCode needs attention:
@@ -75,6 +79,26 @@ Zellij session. This gives you:
 If you don't use Zellij, Ghostty, or macOS, the plugin still does something
 useful: it falls back to desktop notifications and/or sound wherever those are
 available, and no-ops otherwise.
+
+### Recommended: meaningful Zellij tab names (fish shell)
+
+By default Zellij names tabs `Tab #1`, `Tab #2`, etc. The plugin's blinking is
+easier to parse when each tab shows the current directory or command instead.
+If you use [fish](https://fishshell.com/), drop [`contrib/zellij.fish`](contrib/zellij.fish)
+into `~/.config/fish/conf.d/` to get:
+
+- Tab renamed to the shortened `$PWD` on shell start and on every `cd`
+- Tab renamed to the running command while it executes, then back to the
+  directory when it completes
+- Targeted per-tab updates using `--tab-id` so background tabs don't get
+  clobbered by foreground activity
+
+```bash
+curl -L https://raw.githubusercontent.com/renjfk/opencode-notify/main/contrib/zellij.fish \
+  -o ~/.config/fish/conf.d/zellij.fish
+```
+
+Requires Zellij 0.44.0+ (for `rename-tab --tab-id`) and [`jq`](https://jqlang.org/).
 
 ## How it works
 
