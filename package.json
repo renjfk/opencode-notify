@@ -1,0 +1,48 @@
+{
+  "name": "@renjfk/opencode-notify",
+  "version": "0.1.0",
+  "description": "Attention notifications for OpenCode. Blinks Zellij tab, plays a sound, and posts a macOS desktop notification when a session goes idle, requests permission, or asks a question.",
+  "keywords": [
+    "ghostty",
+    "macos",
+    "notification",
+    "notify",
+    "opencode",
+    "plugin",
+    "terminal-notifier",
+    "zellij"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/renjfk/opencode-notify.git"
+  },
+  "files": [
+    "index.js",
+    "lib"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js"
+    },
+    "./tui": {
+      "import": "./index.js"
+    }
+  },
+  "scripts": {
+    "lint": "npx oxlint .",
+    "fmt": "npx oxfmt --check .",
+    "fmt:fix": "npx oxfmt --write .",
+    "check": "npm run lint && npm run fmt",
+    "prepack": "npm run check"
+  },
+  "devDependencies": {
+    "oxfmt": "0.45.0",
+    "oxlint": "1.60.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}
