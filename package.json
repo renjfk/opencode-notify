@@ -39,7 +39,7 @@
     "prepack": "npm run check"
   },
   "devDependencies": {
-    "oxfmt": "0.45.0",
-    "oxlint": "1.60.0"
+    "oxfmt": "0.50.0",
+    "oxlint": "1.65.0"
   }
 }
