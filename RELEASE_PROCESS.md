@@ -68,7 +68,7 @@ Use `gh workflow run` to trigger the "Publish Release" workflow:
 gh workflow run release.yml \
   -f release_tag="v[VERSION]" \
   -f release_notes="[generated content]" \
-  -f draft=true \
+  -f draft=false \
   -f prerelease=false
 
 Please start with Step 1 - analyze the commits and show me the preview.
@@ -81,7 +81,7 @@ opencode will:
 1. **Analyze commits** since last release via `gh` CLI
 2. **Generate release notes** with proper formatting and categorization
 3. **Show preview** and ask for approval
-4. **Trigger GitHub Actions workflow** with the release notes
+4. **Trigger GitHub Actions workflow** with the release notes as a non-draft release
 5. **Workflow** sets the package version, publishes to npm with provenance, and creates a GitHub Release
 
 ## Features
