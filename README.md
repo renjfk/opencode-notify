@@ -142,7 +142,8 @@ opencode-notify is open to contributions and ideas!
 ### Development
 
 ```bash
-npm run check        # lint + fmt
+npm run check        # test + lint + fmt
+npm test             # node:test unit tests
 npm run lint         # oxlint
 npm run fmt          # oxfmt --check
 npm run fmt:fix      # oxfmt --write
