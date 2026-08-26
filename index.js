@@ -26,19 +26,26 @@ const POLL_INTERVAL_MS = 1000;
 
 const ATTENTION_EVENTS = new Set(["session.idle", "permission.asked", "question.asked"]);
 
-export default {
-  id: "opencode-notify",
-  tui: async (api) => {
+export function createTui(dependencies = {}) {
+  const {
+    createZellij: makeZellij = createZellij,
+    createGhostty: makeGhostty = createGhostty,
+    createNotifier: makeNotifier = createNotifier,
+    createSound: makeSound = createSound,
+    getSessionTitle: getTitle = getSessionTitle,
+  } = dependencies;
+
+  return async (api) => {
     const client = api.client;
 
     function toast(message, variant = "info") {
       api.ui.toast({ message, variant, duration: 4000 });
     }
 
-    const zellij = await createZellij();
-    const ghostty = await createGhostty();
-    const notifier = await createNotifier();
-    const sound = await createSound();
+    const zellij = await makeZellij();
+    const ghostty = await makeGhostty();
+    const notifier = await makeNotifier();
+    const sound = await makeSound();
 
     // Startup warnings - never throw, just inform the user what is disabled.
     if (!zellij.available) {
@@ -82,7 +89,7 @@ export default {
       if (!notifier.available) return;
       const sessionID = event.properties?.sessionID;
       const tabName = zellij.available ? await zellij.getTabName() : "OpenCode";
-      const sessionTitle = (await getSessionTitle(client, sessionID)) || "";
+      const sessionTitle = (await getTitle(client, sessionID)) || "";
 
       let message;
       if (event.type === "permission.asked") {
@@ -159,5 +166,10 @@ export default {
         }
       });
     }
-  },
+  };
+}
+
+export default {
+  id: "opencode-notify",
+  tui: createTui(),
 };
