@@ -36,24 +36,52 @@ configured, the push replaces the desktop notification unless
 `"desktop": "keep"` is set.
 
 Pushes are not tied to lock detection alone: a runtime toggle in the
-command palette (`Push notifications: automatic / always on / off`) overrides
-it, see [Push notifications via ntfy](#push-notifications-via-ntfy-optional).
+command palette (`Push notifications`) overrides it, see
+[Push notifications via ntfy](#push-notifications-via-ntfy-optional).
 
 The tab blinking stops when:
 
 - You switch to the tab (detected via polling)
 - OpenCode goes busy again (you responded)
 
+### Multiple TUIs on the shared server (Zellij tabs)
+
+OpenCode v2 runs one shared server for every TUI instance, and every instance
+receives every event. Each instance signals only events whose project
+directory matches its own: when a session finishes in another Zellij tab
+(running a different project), that tab's instance blinks and notifies - the
+tab you are in stays quiet, and another tab going busy no longer clears this
+tab's blink marker or notification.
+
+Events without a location, and instances whose directory is unknown, fall
+through unchanged. Two TUIs opened in the **same** directory both signal the
+same events: location cannot tell them apart, and staying quiet would risk
+nobody signalling at all.
+
 ## Install
 
-Add to your `tui.json` (create at `~/.config/opencode/tui.json` if it doesn't exist):
+Add to `~/.config/opencode/cli.json` (create it if it doesn't exist; this is a
+TUI-only plugin, so the server-side `opencode.json` cannot load it):
 
 ```json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@renjfk/opencode-notify"]
+  "plugins": [{ "package": "@renjfk/opencode-notify" }]
 }
 ```
+
+> **Disable the built-in notifications plugin.** OpenCode V2 ships a built-in
+> `opencode.notifications` plugin that fires on the same events (task done,
+> permission, question). Left enabled, it double-notifies alongside this
+> plugin. Turn it off by adding `"-opencode.notifications"` to the `plugins`
+> array in `cli.json` (the TUI plugin list), for example:
+>
+> ```json
+> {
+>   "plugins": ["@renjfk/opencode-notify", "-opencode.notifications"]
+> }
+> ```
+>
+> Entries starting with `-` disable the matching built-in plugin.
 
 ### Refresh cached plugin after updates
 
@@ -131,13 +159,15 @@ phone via [ntfy](https://ntfy.sh) - install the
 your topic. Works with the public ntfy.sh server and self-hosted instances,
 with or without authentication.
 
-Enable it by passing plugin options in `tui.json`:
+Enable it by passing plugin options:
 
 ```json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": [
-    ["@renjfk/opencode-notify", { "ntfy": { "topic": "opencode-notify-YOUR-RANDOM-SUFFIX" } }]
+  "plugins": [
+    {
+      "package": "@renjfk/opencode-notify",
+      "options": { "ntfy": { "topic": "opencode-notify-YOUR-RANDOM-SUFFIX" } }
+    }
   ]
 }
 ```
@@ -156,7 +186,7 @@ Enable it by passing plugin options in `tui.json`:
 | `detail`          | `full`            | `minimal` keeps pushes generic (like desktop notifications) and turns replies off             |
 | `maxMessageBytes` | `3800`            | Byte cap for push bodies; raise it for self-hosted servers with a higher `message_size_limit` |
 
-The token is read from the environment, never stored in `tui.json` - load it
+The token is read from the environment, never stored in the config - load it
 from your secret manager of choice before starting opencode (e.g.
 `OPENCODE_NOTIFY_TOKEN=$(rbw get ...) opencode`).
 
@@ -164,11 +194,10 @@ Example for a self-hosted instance with access-token auth:
 
 ```json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": [
-    [
-      "@renjfk/opencode-notify",
-      {
+  "plugins": [
+    {
+      "package": "@renjfk/opencode-notify",
+      "options": {
         "ntfy": {
           "server": "https://ntfy.example.com",
           "topic": "opencode-notify",
@@ -176,7 +205,7 @@ Example for a self-hosted instance with access-token auth:
           "desktop": "keep"
         }
       }
-    ]
+    }
   ]
 }
 ```
@@ -240,15 +269,17 @@ notifications: session title + event message) and the reply channel is off.
 
 ### Push modes and the runtime toggle
 
-Lock detection is only one trigger. Once ntfy is configured, three commands
-appear in the command palette (category "Notify") and can be switched at any
-time; the choice is persisted and survives restarts:
+Lock detection is only one trigger. Once ntfy is configured, a `Push
+notifications` command appears in the command palette (category "Notify").
+Selecting it opens the same sliding selection menu opencode's system settings
+use, with the current mode marked; the choice is persisted and survives
+restarts:
 
-| Command                         | Behavior                                                          |
-| ------------------------------- | ----------------------------------------------------------------- |
-| `Push notifications: automatic` | Push when the screen is locked (default)                          |
-| `Push notifications: always on` | Push whenever the terminal is not visible or the screen is locked |
-| `Push notifications: off`       | Never push                                                        |
+| Mode        | Behavior                                                          |
+| ----------- | ----------------------------------------------------------------- |
+| `Automatic` | Push when the screen is locked (default)                          |
+| `Always on` | Push whenever the terminal is not visible or the screen is locked |
+| `Off`       | Never push                                                        |
 
 `always on` is the escape hatch for the limits of lock detection: it covers
 stepping away without locking, displays that sleep without locking, and
@@ -290,15 +321,29 @@ place (unless `"desktop": "keep"`).
   IORegistry (`CGSSessionScreenIsLocked`, the same source CoreGraphics
   exposes), which works on modern macOS including 26. Displays that sleep
   without locking are not detected. On other platforms lock detection is
-  unavailable; switch to `always on` via the command palette to get pushes
+  unavailable; switch to `Always on` via the `Push notifications` palette
+  command to get pushes
   there (a warning toast points this out if you configure ntfy on such a
   system).
 
 ## How it works
 
-1. On every attention event (`session.idle` after busy, `permission.asked`,
+The plugin listens to the live OpenCode V2 events: `session.execution.started`
+marks a session busy, `session.execution.succeeded` and
+`session.execution.interrupted` are treated as task completion, and
+`session.execution.failed` raises a "Session failed" attention event. Permission
+prompts arrive as `permission.asked` and questions as `form.created` (the V2
+name for the old `question.asked`). A finished subagent is skipped, since it
+reports back to its parent rather than to you.
+
+1. On every attention event (a task finishing or failing, `permission.asked`,
    `question.asked`), the plugin checks:
-   - Is the Zellij tab hosting OpenCode active?
+   - Is the session being viewed? That is true only when the Zellij tab hosting
+     OpenCode is active **and**, when OpenCode session tabs are enabled and
+     this session is an open tab, its OpenCode tab is the active one. A
+     background OpenCode session tab inside the active Zellij tab is not being
+     viewed, so it still gets a signal. When tabs are disabled or the session
+     is not an open tab, the Zellij tab alone decides.
    - Is a Ghostty window visible on screen?
    - Is the screen locked (macOS)?
 2. If the tab is inactive, the plugin renames it to blink between `●` and `○`

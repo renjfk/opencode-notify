@@ -149,9 +149,10 @@ test("Zellij falls back to neutral answers when output is unusable", async () =>
     },
   });
 
-  // list-panes fails: no pane found, tab name falls back, tab counts as active.
+  // list-panes fails: no pane found, tab name falls back, and the tab is
+  // treated as not active so a missing pane never swallows a signal.
   assert.equal(await zellij.getTabName(), "opencode");
-  assert.equal(await zellij.isTabActive(), true);
+  assert.equal(await zellij.isTabActive(), false);
 
   const zellijBadTabInfo = await createZellij({
     paneId: "7",
@@ -163,8 +164,8 @@ test("Zellij falls back to neutral answers when output is unusable", async () =>
       return { code: 0, stdout: "not json" };
     },
   });
-  // current-tab-info emits garbage: treat the tab as active rather than guessing.
-  assert.equal(await zellijBadTabInfo.isTabActive(), true);
+  // current-tab-info emits garbage: treat the tab as not active rather than guessing.
+  assert.equal(await zellijBadTabInfo.isTabActive(), false);
 
   const zellijBadPanes = await createZellij({
     paneId: "7",
@@ -173,7 +174,7 @@ test("Zellij falls back to neutral answers when output is unusable", async () =>
   });
   // list-panes emits garbage: no pane found, fall back to neutral answers.
   assert.equal(await zellijBadPanes.getTabName(), "opencode");
-  assert.equal(await zellijBadPanes.isTabActive(), true);
+  assert.equal(await zellijBadPanes.isTabActive(), false);
 });
 
 test("Zellij blinks the tab and stops when the tab becomes active", async () => {

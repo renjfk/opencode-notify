@@ -9,7 +9,9 @@ Single TUI plugin exported from `index.js` with logic split into `lib/`.
 
 ## Key invariants
 
-- Single default export: `{ id, tui }`. No server-side plugin.
+- Single TUI plugin via `Plugin.define` from `@opencode/plugin/tui`; `setup`
+  returns a cleanup that detaches the data listeners and runs the disposers.
+  No server-side plugin.
 - Capabilities are optional and independently probed at startup. Missing
   dependencies never throw — the plugin skips that branch and continues.
 - When Ghostty visibility is unknown, treat as "not visible" and notify.
@@ -17,7 +19,20 @@ Single TUI plugin exported from `index.js` with logic split into `lib/`.
   user-controlled strings (the lone exception, `hasBinary`, passes
   hardcoded binary names).
 - No dotfile I/O. All persistence goes through `api.kv`.
+- The location gate (`locationDirectory`) accepts a string or a function and
+  must be read per event: the TUI's location changes at runtime.
 - No build step. Plain ESM JavaScript, shipped as-is.
+- Listen to V2 execution events, not the deprecated V1 `session.idle` (in V2 it
+  has no producer): `session.execution.started` is busy,
+  `session.execution.succeeded`/`interrupted` are completion, and
+  `session.execution.failed` is the error path. See the built-in
+  `opencode.notifications` plugin for the canonical event set.
+- "Being viewed" requires BOTH the Zellij tab and, when session tabs are
+  enabled and the session is an open tab, its OpenCode tab to be active; a
+  background OpenCode tab inside the active Zellij tab must still signal.
+- The built-in `opencode.notifications` plugin must be disabled (add
+  `"-opencode.notifications"` to the `plugins` array in `cli.json`) or both
+  plugins double-notify the same events.
 
 ## Testing
 

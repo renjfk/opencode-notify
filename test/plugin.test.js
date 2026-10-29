@@ -16,6 +16,84 @@ test("does nothing when the tab and terminal are visible", async () => {
   assert.equal(fixture.sound.playCount, 0);
 });
 
+test("ignores attention events from another location", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    locationDirectory: "/tabs/one",
+  });
+
+  await fixture.emit("permission.asked", {
+    properties: { sessionID: "session-1" },
+    location: { directory: "/tabs/two" },
+  });
+
+  assert.equal(fixture.zellij.startCount, 0);
+  assert.equal(fixture.notifier.calls.length, 0);
+  assert.equal(fixture.sound.playCount, 0);
+});
+
+test("signals attention events from its own location", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    locationDirectory: "/tabs/one",
+  });
+
+  await fixture.emit("permission.asked", {
+    properties: { sessionID: "session-1" },
+    location: { directory: "/tabs/one" },
+  });
+
+  assert.equal(fixture.zellij.startCount, 1);
+  assert.equal(fixture.notifier.calls.length, 1);
+});
+
+test("events without a location pass through unchanged", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    locationDirectory: "/tabs/one",
+  });
+
+  await fixture.emit("permission.asked", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.zellij.startCount, 1);
+  assert.equal(fixture.notifier.calls.length, 1);
+});
+
+test("a busy session in another location does not clear this tab's signals", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    locationDirectory: "/tabs/one",
+  });
+
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
+    location: { directory: "/tabs/one" },
+  });
+  await fixture.emit("session.execution.succeeded", {
+    properties: { sessionID: "session-1" },
+    location: { directory: "/tabs/one" },
+  });
+  assert.equal(fixture.zellij.startCount, 1);
+  assert.equal(fixture.notifier.calls.length, 1);
+  // The own busy event legitimately settles this tab's signals once; the
+  // foreign event below must not touch them again.
+  const stopCount = fixture.zellij.stopCount;
+  const clearCount = fixture.notifier.clearCount;
+
+  // Another tab's session going busy must not stop this tab's blink marker
+  // or clear its pending desktop notification.
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-9" },
+    location: { directory: "/tabs/two" },
+  });
+  assert.equal(fixture.zellij.stopCount, stopCount);
+  assert.equal(fixture.notifier.clearCount, clearCount);
+});
+
 test("blinks and plays sound for an inactive tab in a visible terminal", async () => {
   const fixture = await createFixture({ tabActive: false, ghosttyVisible: true });
 
@@ -29,13 +107,13 @@ test("blinks and plays sound for an inactive tab in a visible terminal", async (
 test("blinks and notifies when the inactive tab is not visible", async () => {
   const fixture = await createFixture({ tabActive: false, ghosttyVisible: false });
 
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   assert.equal(fixture.zellij.startCount, 0);
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   assert.equal(fixture.zellij.startCount, 1);
   assert.deepEqual(fixture.notifier.calls, [
@@ -46,6 +124,141 @@ test("blinks and notifies when the inactive tab is not visible", async () => {
       sound: "Blow",
     },
   ]);
+});
+
+test("treats an interrupted execution as task completed", async () => {
+  const fixture = await createFixture(
+    { tabActive: true, ghosttyVisible: true, locked: true, ntfy: true },
+    { ntfy: { topic: "opencode-notify-abc123" } },
+  );
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.interrupted", {
+    properties: { sessionID: "session-1", reason: "user" },
+  });
+
+  assert.equal(fixture.ntfy.calls[0].message, "Task completed");
+});
+
+test("notifies with an error when an execution fails", async () => {
+  const fixture = await createFixture({ tabActive: false, ghosttyVisible: false });
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.failed", {
+    properties: { sessionID: "session-1", error: { type: "unknown", message: "boom" } },
+  });
+
+  assert.deepEqual(fixture.notifier.calls, [
+    {
+      title: "work",
+      subtitle: "Implement notifications",
+      message: "Session failed",
+      sound: "Blow",
+    },
+  ]);
+});
+
+test("a finished subagent does not signal", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    subagent: true,
+  });
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.notifier.calls.length, 0);
+  assert.equal(fixture.zellij.startCount, 0);
+});
+
+test("a session completing while a background subagent runs does not signal yet", async () => {
+  let childRunning = true;
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    hasRunningChild: () => childRunning,
+  });
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  // The parent reports completion, but a direct child is still running and
+  // will re-wake it: signalling now would fire twice.
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
+  assert.equal(fixture.notifier.calls.length, 0);
+  assert.equal(fixture.zellij.startCount, 0);
+
+  // The child re-wakes the parent, the child finishes, and only the final
+  // completion signals.
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  childRunning = false;
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
+  assert.equal(fixture.notifier.calls.length, 1);
+});
+
+test("the location gate reads a function-valued directory per event", async () => {
+  let own = "/tabs/one";
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    locationDirectory: () => own,
+  });
+
+  // Initially foreign: another instance owns /tabs/two.
+  await fixture.emit("permission.asked", {
+    properties: { sessionID: "session-1" },
+    location: { directory: "/tabs/two" },
+  });
+  assert.equal(fixture.notifier.calls.length, 0);
+
+  // The TUI opens a session from /tabs/two (open dialog, /cd, or a moved
+  // session): the same event directory is now this instance's own.
+  own = "/tabs/two";
+  await fixture.emit("permission.asked", {
+    properties: { sessionID: "session-1" },
+    location: { directory: "/tabs/two" },
+  });
+  assert.equal(fixture.notifier.calls.length, 1);
+});
+
+test("a background OpenCode session tab signals on the active Zellij tab", async () => {
+  const fixture = await createFixture({
+    tabActive: true,
+    ghosttyVisible: true,
+    sessionTabActive: false,
+  });
+
+  await fixture.emit("question.asked", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.zellij.startCount, 1);
+  assert.equal(fixture.sound.playCount, 1);
+  assert.equal(fixture.notifier.calls.length, 0);
+});
+
+test("the active OpenCode session tab on the active Zellij tab stays quiet", async () => {
+  const fixture = await createFixture({
+    tabActive: true,
+    ghosttyVisible: true,
+    sessionTabActive: true,
+  });
+
+  await fixture.emit("question.asked", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.zellij.startCount, 0);
+  assert.equal(fixture.sound.playCount, 0);
+  assert.equal(fixture.notifier.calls.length, 0);
+});
+
+test("falls back to the Zellij tab when the session is not an open tab", async () => {
+  const fixture = await createFixture({
+    tabActive: true,
+    ghosttyVisible: true,
+    sessionTabActive: undefined,
+  });
+
+  await fixture.emit("question.asked", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.zellij.startCount, 0);
+  assert.equal(fixture.sound.playCount, 0);
 });
 
 test("sends an ntfy push instead of desktop notification when the screen is locked", async () => {
@@ -107,8 +320,8 @@ test("sends an ntfy push instead of desktop notification when the screen is lock
 
   // The request stays tracked for phone replies; settle the session so the
   // reply poll stops and the test process can exit.
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
 });
 
@@ -124,10 +337,10 @@ test("task completed pushes carry the agent's last message without reply buttons
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   assert.equal(fixture.ntfy.calls[0].title, "Implement notifications");
   assert.equal(fixture.ntfy.calls[0].message, "Deployed to staging.");
@@ -159,8 +372,8 @@ test("permission pushes get approve, always, and reject buttons", async () => {
   ]);
 
   // Settle the session so the reply poll stops and the test process exits.
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
 });
 
@@ -442,10 +655,10 @@ test("push mode still blinks a background tab when locked", async () => {
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   assert.equal(fixture.ntfy.calls.length, 1);
   assert.equal(fixture.zellij.startCount, 1);
@@ -457,10 +670,10 @@ test("always-on mode stays quiet while the session is watched", async () => {
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   // The push replaces the desktop notification: while the user is watching
   // the session there is nothing to signal - no push, no blink, no toast.
@@ -475,10 +688,10 @@ test("always-on mode keeps the in-terminal signals on a visible background tab",
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   // Mirrors the desktop path: blink + sound, no push (the terminal is up).
   assert.equal(fixture.ntfy.calls.length, 0);
@@ -499,8 +712,8 @@ test("always-on mode pushes when the terminal is not visible", async () => {
   assert.equal(fixture.notifier.calls.length, 0);
 
   // Settle the session so the tracked request stops the reply poll.
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
 });
 
@@ -528,8 +741,8 @@ test("off mode still queues a desktop notification when locked with everything v
   assert.equal(fixture.notifier.calls.length, 1);
 
   // The visibility poll started; go busy again so its timer is stopped.
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
 });
 
@@ -558,35 +771,63 @@ test("visibility poll does not clear the notification while the screen stays loc
   }
 });
 
-test("mode commands persist the choice, toast, and take effect immediately", async () => {
+test("the push menu command persists the choice, toasts, and takes effect immediately", async () => {
   const fixture = await createFixture(
-    { tabActive: true, ghosttyVisible: false, locked: false, ntfy: true },
+    { tabActive: true, ghosttyVisible: false, locked: false, ntfy: true, selectResult: "on" },
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
+  // One palette entry instead of one per mode.
   const names = fixture.commands.map((command) => command.name);
-  assert.deepEqual(names, ["notify.push.auto", "notify.push.on", "notify.push.off"]);
+  assert.deepEqual(names, ["notify.push"]);
 
-  fixture.commands.find((command) => command.name === "notify.push.on").run();
+  await fixture.commands[0].run();
   assert.equal(fixture.kv.get("notify.pushMode"), "on");
   assert.match(fixture.toasts.at(-1).message, /always on/);
+
+  // The select menu offered all three modes with the current one marked.
+  assert.equal(fixture.selectCalls.length, 1);
+  assert.equal(fixture.selectCalls[0].title, "Push notifications");
+  assert.equal(fixture.selectCalls[0].current, "auto");
+  assert.deepEqual(
+    fixture.selectCalls[0].options.map((option) => option.value),
+    ["auto", "on", "off"],
+  );
 
   await fixture.emit("question.asked", { properties: { sessionID: "session-1" } });
   assert.equal(fixture.ntfy.calls.length, 1);
 });
 
-test("auto mode command warns when lock detection is unavailable", async () => {
+test("choosing automatic in the push menu warns when lock detection is unavailable", async () => {
   const fixture = await createFixture(
-    { tabActive: true, ghosttyVisible: false, ntfy: true, lockAvailable: false },
+    {
+      tabActive: true,
+      ghosttyVisible: false,
+      ntfy: true,
+      lockAvailable: false,
+      selectResult: "auto",
+    },
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
-  fixture.commands.find((command) => command.name === "notify.push.auto").run();
+  await fixture.commands[0].run();
   assert.equal(fixture.kv.get("notify.pushMode"), "auto");
   assert.match(fixture.toasts.at(-1).message, /lock detection unavailable/);
 });
 
-test("mode commands are not registered when ntfy is not configured", async () => {
+test("dismissing the push menu without a choice keeps the current mode", async () => {
+  const fixture = await createFixture(
+    { tabActive: true, ghosttyVisible: false, locked: false, ntfy: true, selectResult: undefined },
+    { ntfy: { topic: "opencode-notify-abc123" } },
+  );
+
+  await fixture.commands[0].run();
+  // Nothing was persisted or confirmed; the menu was simply dismissed.
+  assert.equal(fixture.kv.get("notify.pushMode"), undefined);
+  assert.equal(fixture.toasts.length, 0);
+});
+
+test("the push menu command is not registered when ntfy is not configured", async () => {
   const fixture = await createFixture({ tabActive: true, ghosttyVisible: false });
 
   assert.deepEqual(fixture.commands, []);
@@ -704,10 +945,10 @@ test("lets a configured priority override the per-event default", async () => {
     { ntfy: { topic: "opencode-notify-abc123", priority: "urgent" } },
   );
 
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
   assert.equal(fixture.ntfy.calls[0].priority, "urgent");
   assert.equal(fixture.ntfy.calls[0].message, "Task completed");
@@ -736,8 +977,8 @@ test("falls back to a desktop notification when locked without ntfy", async () =
 
   // Locked counts as not visible, which starts the visibility poll. Go busy
   // again so the poll timer is stopped and the test process can exit.
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
 });
 
@@ -753,8 +994,8 @@ test("a push that lands after the session goes busy does not restart blinking", 
 
   // The user answers while the push is still in flight; the busy handler
   // stops blinking and clears notifications.
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
   assert.equal(fixture.zellij.stopCount, 1);
 
@@ -794,8 +1035,8 @@ test("another session going busy does not cancel an in-flight push", async () =>
 
     // A different session becomes active while session-1's push is in
     // flight: only that session's attention work is stale, not session-1's.
-    await fixture.emit("session.status", {
-      properties: { status: { type: "busy" }, sessionID: "session-2" },
+    await fixture.emit("session.execution.started", {
+      properties: { sessionID: "session-2" },
     });
 
     fixture.releaseNtfySend();
@@ -895,20 +1136,27 @@ test("switching pushes off cancels notifications queued in the batch window", as
   mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   try {
     const fixture = await createFixture(
-      { tabActive: true, ghosttyVisible: false, locked: true, ntfy: true, batchMs: 5000 },
+      {
+        tabActive: true,
+        ghosttyVisible: false,
+        locked: true,
+        ntfy: true,
+        batchMs: 5000,
+        selectResult: "off",
+      },
       { ntfy: { topic: "opencode-notify-abc123" } },
     );
 
-    await fixture.emit("session.status", {
-      properties: { status: { type: "busy" }, sessionID: "session-1" },
+    await fixture.emit("session.execution.started", {
+      properties: { sessionID: "session-1" },
     });
-    await fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+    await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
 
     // The task-completed push sits in the batch queue, not yet sent...
     assert.equal(fixture.ntfy.calls.length, 0);
 
     // ...and turning pushes off must cancel it, not just future pushes.
-    fixture.commands.find((command) => command.name === "notify.push.off").run();
+    await fixture.commands[0].run();
     await mock.timers.tick(6000);
     await flush();
     await flush();
@@ -920,19 +1168,28 @@ test("switching pushes off cancels notifications queued in the batch window", as
 
 test("turning pushes off while content is still loading cancels the push", async () => {
   const fixture = await createFixture(
-    { tabActive: true, ghosttyVisible: true, locked: true, ntfy: true, holdAgentText: true },
+    {
+      tabActive: true,
+      ghosttyVisible: true,
+      locked: true,
+      ntfy: true,
+      holdAgentText: true,
+      selectResult: "off",
+    },
     { ntfy: { topic: "opencode-notify-abc123" } },
   );
 
-  await fixture.emit("session.status", {
-    properties: { status: { type: "busy" }, sessionID: "session-1" },
+  await fixture.emit("session.execution.started", {
+    properties: { sessionID: "session-1" },
   });
-  const attention = fixture.emit("session.idle", { properties: { sessionID: "session-1" } });
+  const attention = fixture.emit("session.execution.succeeded", {
+    properties: { sessionID: "session-1" },
+  });
   await flush();
 
   // The agent text lookup is still in flight when the user turns pushes
   // off: the completing handler must not publish what it was loading.
-  fixture.commands.find((command) => command.name === "notify.push.off").run();
+  await fixture.commands[0].run();
   fixture.releaseAgentText();
   await attention;
 
@@ -973,12 +1230,18 @@ async function createFixture(
     pushMode,
     kvReadyDelay = 0,
     throwOnTabActive = false,
+    subagent = false,
+    hasRunningChild,
+    sessionTabActive,
+    selectResult,
+    locationDirectory,
   } = {},
   options,
 ) {
   const handlers = new Map();
   const toasts = [];
   const commands = [];
+  const selectCalls = [];
   const disposers = [];
   const kvStore = {};
   const clientCalls = [];
@@ -1117,6 +1380,13 @@ async function createFixture(
       return agentText;
     },
     generateReplyTag: () => replyTags.shift() ?? "abcdef",
+    isSubagent: () => subagent,
+    hasRunningChild,
+    // undefined keeps the Zellij-only fallback; true/false exercise the
+    // OpenCode session-tab integration.
+    isSessionTabActive: () => sessionTabActive,
+    // The TUI instance's own directory; undefined disables location gating.
+    locationDirectory,
   });
   await tui(
     {
@@ -1129,7 +1399,13 @@ async function createFixture(
       },
       kv,
       lifecycle: { onDispose: (fn) => disposers.push(fn) },
-      ui: { toast: (toast) => toasts.push(toast) },
+      ui: {
+        toast: (toast) => toasts.push(toast),
+        select: async (options) => {
+          selectCalls.push(options);
+          return selectResult;
+        },
+      },
     },
     options,
   );
@@ -1141,6 +1417,7 @@ async function createFixture(
     kv,
     notifier,
     ntfy: ntfyCapability,
+    selectCalls,
     queueReply: (message) =>
       incoming.push({ id: `in_${++incomingSeq}`, event: "message", message }),
     releaseNtfySend: () => releaseHeldNtfySend?.(),

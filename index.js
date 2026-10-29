@@ -1,8 +1,12 @@
 // opencode-notify: attention notifications for OpenCode.
 //
-// On attention events (session idle after work, permission asked, question
-// asked), the plugin decides what to do based on which capabilities are
-// available and whether the user is likely to miss the event:
+// On attention events (a task finishing or failing, permission asked,
+// question asked), the plugin decides what to do based on which capabilities
+// are available and whether the user is likely to miss the event:
+//
+// "Tab active" means the session is actually being viewed: the Zellij tab is
+// active and, when OpenCode session tabs are enabled and the session is an
+// open tab, its OpenCode tab is the active one.
 //
 //   Tab active | Ghostty visible | Screen locked | Action
 //   -----------|-----------------|---------------|----------------------------------------
@@ -28,6 +32,14 @@
 // Every capability (Zellij, Ghostty, terminal-notifier, afplay, lock
 // detection, ntfy) is optional and probed at startup. Missing capabilities
 // are skipped gracefully and the plugin continues with whatever is available.
+//
+// With the V2 shared server every TUI instance receives every event, so each
+// instance signals only events whose location (project directory) matches its
+// own TUI: attention owed in another Zellij tab is that tab's instance's job.
+// Events without a location, or when the instance's own directory is unknown,
+// fall through unchanged. Two instances in the same directory both signal -
+// location cannot disambiguate them, and dropping the event would risk
+// nobody signalling at all.
 
 import { randomUUID } from "node:crypto";
 import { createPushCoalescer } from "./lib/coalesce.js";
@@ -50,21 +62,46 @@ import {
 const DEBOUNCE_MS = 2000;
 const POLL_INTERVAL_MS = 1000;
 
-const ATTENTION_EVENTS = new Set(["session.idle", "permission.asked", "question.asked"]);
+// The V2 TUI runtime injects `@opencode/plugin/tui`. Fall back to the identity
+// contract when the module is unavailable (plain `node --test` without the
+// runtime), so the definition stays loadable either way.
+let Plugin = { define: (definition) => definition };
+try {
+  ({ Plugin } = await import("@opencode/plugin/tui"));
+} catch {}
+
+// V2 execution events carry the completion and failure signals V1 delivered
+// as `session.idle` - which in V2 is deprecated and has no producer, so
+// relying on it silently dropped every finished task. Each entry maps the live
+// V2 event onto the logical attention kind the decision matrix is built
+// around; `session.execution.succeeded`/`interrupted` take the old
+// `session.idle` path unchanged.
+const ATTENTION_EVENTS = new Map([
+  ["session.execution.succeeded", "session.idle"],
+  ["session.execution.interrupted", "session.idle"],
+  ["session.execution.failed", "session.execution.failed"],
+  ["permission.asked", "permission.asked"],
+  ["question.asked", "question.asked"],
+]);
 
 const ATTENTION_META = {
   "permission.asked": { message: "Permission requested", priority: "high", tags: ["warning"] },
   "question.asked": { message: "Question needs your answer", priority: "high", tags: ["question"] },
   "session.idle": { message: "Task completed", priority: "default", tags: ["white_check_mark"] },
+  "session.execution.failed": { message: "Session failed", priority: "high", tags: ["x"] },
 };
 
 const PUSH_MODES = ["auto", "on", "off"];
 const KV_PUSH_MODE = "notify.pushMode";
 
 const PUSH_MODE_META = {
-  auto: { label: "automatic (when the screen locks)", title: "Push notifications: automatic" },
-  on: { label: "always on", title: "Push notifications: always on" },
-  off: { label: "off", title: "Push notifications: off" },
+  auto: {
+    label: "automatic (when the screen locks)",
+    title: "Push notifications: automatic",
+    menuTitle: "Automatic",
+  },
+  on: { label: "always on", title: "Push notifications: always on", menuTitle: "Always on" },
+  off: { label: "off", title: "Push notifications: off", menuTitle: "Off" },
 };
 
 /**
@@ -91,6 +128,27 @@ export function createTui(dependencies = {}) {
     getSessionTitle: getTitle = getSessionTitle,
     getLastAgentText: getAgentText = getLastAgentText,
     generateReplyTag = () => randomUUID().replace(/-/g, "").slice(0, 6),
+    // A subagent session reports back to its parent; a finished subagent is
+    // not a task the user is waiting on, so it never signals on its own.
+    isSubagent = () => false,
+    // OpenCode session-tab state for the event's session. Returns true when
+    // the session's tab is the active tab, false when it is an open but
+    // background tab, and undefined when tabs are disabled or the session is
+    // not an open tab (so the caller falls back to the Zellij check alone).
+    isSessionTabActive = () => undefined,
+    // True while a direct child session (a background subagent) of the given
+    // session is still running. A child's completion re-wakes the parent, so
+    // the parent's own completion is not the end of the turn yet.
+    hasRunningChild = () => false,
+    // Directory of the location this TUI instance runs in, when known: a
+    // string or a function returning one (read per event, because the TUI's
+    // location changes when a session from another directory is opened or
+    // moved). The V2 shared server broadcasts every event to every connected
+    // TUI, so events carrying a different directory belong to another
+    // instance (another Zellij tab, another project) and are ignored.
+    // Undefined, or an event without a location, falls through: single-instance
+    // setups and tests keep the previous behavior.
+    locationDirectory = undefined,
   } = dependencies;
 
   return async (api, options) => {
@@ -191,16 +249,33 @@ export function createTui(dependencies = {}) {
     }
 
     // Runtime mode switch via the command palette (only when ntfy is used).
+    // One palette entry opens the sliding select menu - the same component
+    // opencode's system settings use - instead of one palette entry per mode.
     if (ntfy.configured && api.keymap?.registerLayer) {
       api.keymap.registerLayer({
-        commands: PUSH_MODES.map((mode) => ({
-          namespace: "palette",
-          name: `notify.push.${mode}`,
-          title: PUSH_MODE_META[mode].title,
-          desc: "opencode-notify: route attention pushes to ntfy",
-          category: "Notify",
-          run: () => setPushMode(mode),
-        })),
+        commands: [
+          {
+            namespace: "palette",
+            name: "notify.push",
+            title: "Push notifications",
+            desc: "opencode-notify: choose when attention pushes go to ntfy",
+            category: "Notify",
+            run: async () => {
+              const mode = await api.ui.select({
+                title: "Push notifications",
+                current: pushMode,
+                options: PUSH_MODES.map((value) => ({
+                  value,
+                  title: PUSH_MODE_META[value].menuTitle,
+                  description: PUSH_MODE_META[value].label,
+                })),
+              });
+              // An explicit choice always re-applies (persisting it and
+              // surfacing capability warnings); dismissing changes nothing.
+              if (mode && PUSH_MODES.includes(mode)) setPushMode(mode);
+            },
+          },
+        ],
       });
     }
 
@@ -223,6 +298,16 @@ export function createTui(dependencies = {}) {
 
     function epochOf(sessionID) {
       return busyEpochs.get(sessionID) ?? 0;
+    }
+
+    // True when the event belongs to a different location: another TUI
+    // instance sharing the server owns it and does the signalling. The own
+    // directory is resolved per event so a changed TUI location (open dialog,
+    // /cd, a session moved to a worktree) takes effect immediately.
+    function isForeignLocation(event) {
+      const own = typeof locationDirectory === "function" ? locationDirectory() : locationDirectory;
+      const eventDirectory = event.location?.directory;
+      return own !== undefined && eventDirectory !== undefined && eventDirectory !== own;
     }
 
     function stopGhosttyPoll() {
@@ -371,26 +456,54 @@ export function createTui(dependencies = {}) {
       broker?.stop();
     });
 
+    async function markBusy(sessionID) {
+      // A subagent going busy must not stop the parent's blink marker or clear
+      // its notification, and it never signals on completion either.
+      if (isSubagent(sessionID)) return;
+      busyEpochs.set(sessionID, epochOf(sessionID) + 1);
+      busySessions.add(sessionID);
+      broker?.clearSession(sessionID);
+      stopGhosttyPoll();
+      await zellij.stopBlinking();
+      if (notifier.available) await notifier.clear();
+    }
+
+    // `session.execution.started` is the live V2 busy signal; the legacy
+    // `session.status` busy event is kept as a secondary source. Both are
+    // gated on location: another tab's session going busy must not stop this
+    // tab's blink marker or clear its pending notification.
+    api.event.on("session.execution.started", async (event) => {
+      if (isForeignLocation(event)) return;
+      await markBusy(event.properties?.sessionID);
+    });
     api.event.on("session.status", async (event) => {
-      if (event.properties?.status?.type === "busy") {
-        const sessionID = event.properties?.sessionID;
-        busyEpochs.set(sessionID, epochOf(sessionID) + 1);
-        busySessions.add(sessionID);
-        broker?.clearSession(sessionID);
-        stopGhosttyPoll();
-        await zellij.stopBlinking();
-        if (notifier.available) await notifier.clear();
-      }
+      if (event.properties?.status?.type !== "busy") return;
+      if (isForeignLocation(event)) return;
+      await markBusy(event.properties?.sessionID);
     });
 
     async function handleAttention(event) {
       const sessionID = event.properties?.sessionID;
+      if (event.type === "session.execution.failed") {
+        // A failed execution ends the busy cycle like a completion does:
+        // bump the epoch so any in-flight attention work for this session is
+        // dropped, then clear the busy marker.
+        busyEpochs.set(sessionID, epochOf(sessionID) + 1);
+        busySessions.delete(sessionID);
+      }
       const epoch = epochOf(sessionID);
       if (event.type === "session.idle") {
         if (!busySessions.has(sessionID)) {
           return;
         }
         busySessions.delete(sessionID);
+        if (isSubagent(sessionID)) return;
+        // With background subagents, a direct child finishing re-wakes this
+        // session, so its turn is not over yet: signalling now would fire
+        // again when the session finally completes. Mirrors the built-in
+        // notifications plugin, which skips completions while a direct
+        // child is still running.
+        if (hasRunningChild(sessionID)) return;
       }
 
       const now = Date.now();
@@ -399,7 +512,15 @@ export function createTui(dependencies = {}) {
       }
       lastNotifyTime = now;
 
-      const tabActive = await zellij.isTabActive();
+      // "Being viewed" needs both the Zellij tab and, when session tabs are
+      // enabled and this session is an open tab, the OpenCode session tab to
+      // point here. A background OpenCode tab inside the active Zellij tab
+      // still needs a signal. Falls back to the Zellij check alone when tabs
+      // are disabled or the session is not an open tab.
+      const zellijTabActive = (await zellij.isTabActive()) === true;
+      const sessionTabActive = isSessionTabActive(sessionID);
+      const tabActive =
+        sessionTabActive === undefined ? zellijTabActive : sessionTabActive && zellijTabActive;
       // Lock state is detected independently of the push mode: "off" must
       // still queue a desktop notification for unlock, and "on" must not
       // depend on detection working. The mode only decides whether ntfy
@@ -472,8 +593,11 @@ export function createTui(dependencies = {}) {
       }
     }
 
-    for (const type of ATTENTION_EVENTS) {
-      api.event.on(type, async (event) => {
+    for (const [eventName, type] of ATTENTION_EVENTS) {
+      api.event.on(eventName, async (event) => {
+        // Another location's attention is that tab's instance's job; without
+        // this gate every Zellij tab would signal every session's events.
+        if (isForeignLocation(event)) return;
         try {
           await handleAttention({ ...event, type });
         } catch (err) {
@@ -484,7 +608,295 @@ export function createTui(dependencies = {}) {
   };
 }
 
-export default {
+// ---------------------------------------------------------------------------
+// V2 TUI entry (`./tui`).
+//
+// The V1 TUI api this plugin was built against (api.kv, api.event.on with
+// { properties }, api.keymap.registerLayer, api.lifecycle.onDispose,
+// api.ui.toast, and client.permission.reply / client.question.reply) is
+// adapted from the V2 TUI plugin context so the behavior below stays
+// unchanged. The one place V2 differs semantically is questions: V1's
+// `question.asked` is the V2 `form.created` event, and V2 answers forms with
+// a keyed object instead of per-question answer arrays.
+// ---------------------------------------------------------------------------
+
+function newestAssistantText(messages) {
+  let best = null;
+  for (const message of messages) {
+    if (message.type !== "assistant") continue;
+    const text = (message.content ?? [])
+      .filter((part) => part.type === "text")
+      .map((part) => part.text || "")
+      .join("\n\n")
+      .trim();
+    const created = message.time?.created ?? 0;
+    if (text && (!best || created >= best.created)) best = { text, created };
+  }
+  return best?.text ?? "";
+}
+
+// Map a V2 form into the V1 `question.asked` shape the notification formatters
+// and reply parsers expect.
+export function formToQuestion(form) {
+  return {
+    sessionID: form.sessionID,
+    id: form.id,
+    questions: (form.fields ?? []).map((field) => ({
+      // V2's question tool puts the short header in `title` and the actual
+      // question in `description`; fall back through both, then the key.
+      question: field.description ?? field.title ?? field.key,
+      header: field.title ?? field.key,
+      options: (field.options ?? []).map((option) => ({
+        label: option.label,
+        description: option.description ?? "",
+      })),
+      multiple: field.type === "multiselect",
+      custom: field.custom !== false,
+    })),
+  };
+}
+
+// Turn the reply channel's per-question answer arrays into the keyed answer
+// object a V2 form expects, using the field order from the original form.
+export function answersToForm(answers, form) {
+  const result = {};
+  const fields = form?.fields ?? [];
+  answers.forEach((answer, index) => {
+    const field = fields[index];
+    if (!field || answer == null) return;
+    if (field.type === "multiselect") {
+      result[field.key] = answer.map((label) => {
+        const option = (field.options ?? []).find(
+          (item) => item.label === label || item.value === label,
+        );
+        return option ? option.value : label;
+      });
+      return;
+    }
+    if (field.type === "boolean") {
+      result[field.key] = /^(yes|true|1)$/i.test(answer[0] ?? "");
+      return;
+    }
+    if (field.type === "number" || field.type === "integer") {
+      const value = Number(answer[0]);
+      result[field.key] = Number.isNaN(value) ? answer[0] : value;
+      return;
+    }
+    // The reply channel sends option labels; a single-select string field
+    // needs the option's value when label and value differ.
+    if (Array.isArray(field.options) && field.options.length > 0) {
+      const option = field.options.find(
+        (item) => item.label === answer[0] || item.value === answer[0],
+      );
+      result[field.key] = option ? option.value : answer[0];
+      return;
+    }
+    result[field.key] = answer[0];
+  });
+  return result;
+}
+
+export function createLegacyApi(context) {
+  // V2 permission and form replies both need the owning session id, which the
+  // reply channel does not carry. Learn it from the attention events the
+  // plugin already observes.
+  const permissionSessions = new Map();
+  const formSessions = new Map();
+  const forms = new Map();
+
+  function track(type, data) {
+    if (type === "permission.asked") permissionSessions.set(data.id, data.sessionID);
+    if (type === "form.created") {
+      formSessions.set(data.form.id, data.form.sessionID);
+      forms.set(data.form.id, data.form);
+    }
+  }
+
+  const unsubscribers = [];
+
+  function subscribeEvent(context, type, handler) {
+    if (type === "question.asked") {
+      return context.data.on("form.created", (item) => {
+        track("form.created", item.data);
+        handler({ type, properties: formToQuestion(item.data.form), location: item.location });
+      });
+    }
+    if (type === "permission.asked") {
+      return context.data.on("permission.asked", (item) => {
+        track("permission.asked", item.data);
+        handler({
+          type,
+          properties: {
+            ...item.data,
+            // V1 named the action `permission`; replies and push bodies
+            // render it ("Permission requested: bash", "Approved bash").
+            permission: item.data.action,
+            // V1 named these `patterns` (displayed) and `always` (persistable).
+            patterns: item.data.resources,
+            always: item.data.save,
+          },
+          location: item.location,
+        });
+      });
+    }
+    if (type === "question.replied") {
+      return context.data.on("form.replied", (item) =>
+        handler({ type, properties: { requestID: item.data.id }, location: item.location }),
+      );
+    }
+    if (type === "question.rejected") {
+      return context.data.on("form.cancelled", (item) =>
+        handler({ type, properties: { requestID: item.data.id }, location: item.location }),
+      );
+    }
+    return context.data.on(type, (item) =>
+      handler({ type, properties: item.data, location: item.location }),
+    );
+  }
+
+  const client = {
+    permission: {
+      async reply(input) {
+        const sessionID = permissionSessions.get(input.requestID);
+        if (!sessionID) throw new Error("unknown permission request");
+        await context.client.permission.reply({
+          sessionID,
+          requestID: input.requestID,
+          decision: input.reply,
+          message: input.message,
+        });
+      },
+    },
+    question: {
+      async reply(input) {
+        const sessionID = formSessions.get(input.requestID);
+        if (!sessionID) throw new Error("unknown form");
+        await context.client.session.form.reply({
+          sessionID,
+          formID: input.requestID,
+          answer: answersToForm(input.answers, forms.get(input.requestID)),
+        });
+      },
+      async reject(input) {
+        const sessionID = formSessions.get(input.requestID);
+        if (!sessionID) throw new Error("unknown form");
+        await context.client.session.form.cancel({ sessionID, formID: input.requestID });
+      },
+    },
+  };
+
+  const event = {
+    on(type, handler) {
+      // Every event envelope carries the owning session's location; the
+      // handlers below gate on it (shared server, multiple TUI instances),
+      // so it must be forwarded, not dropped with the rest of the envelope.
+      // Unsubscribe functions are collected: the TUI host does not scope
+      // `context.data` listeners to the plugin, and a hot reload would
+      // otherwise leave the old instance handling events forever.
+      const unsubscribe = subscribeEvent(context, type, handler);
+      unsubscribers.push(unsubscribe);
+      return unsubscribe;
+    },
+    dispose() {
+      while (unsubscribers.length > 0) {
+        try {
+          unsubscribers.pop()();
+        } catch {
+          // A dead listener must not block the rest of the cleanup.
+        }
+      }
+    },
+  };
+
+  const [store, update] = context.storage.store("state", { initial: { pushMode: "auto" } });
+  const kv = {
+    ready: true,
+    get: (key, fallback) => (key in store ? store[key] : fallback),
+    set: (key, value) => {
+      void update((draft) => {
+        draft[key] = value;
+      });
+    },
+  };
+
+  const keymap = {
+    registerLayer(layer) {
+      context.keymap.layer(() => ({
+        mode: "global",
+        commands: (layer.commands ?? []).map((command) => ({
+          id: command.name,
+          title: command.title,
+          description: command.desc,
+          group: command.category,
+          palette: true,
+          run: command.run,
+        })),
+      }));
+    },
+  };
+
+  return {
+    client,
+    event,
+    kv,
+    keymap,
+    ui: {
+      toast: (toast) => context.ui.toast.show(toast),
+      // The sliding select menu the system settings use; resolves to the
+      // chosen value, or undefined when dismissed.
+      select: (options) => context.ui.dialog.select(options),
+    },
+  };
+}
+
+export default Plugin.define({
   id: "opencode-notify",
-  tui: createTui(),
-};
+  async setup(context) {
+    const disposers = [];
+    const api = createLegacyApi(context);
+    const run = createTui({
+      getSessionTitle: async (_client, sessionID) =>
+        context.data.session.get(sessionID)?.title || "",
+      getLastAgentText: async (_client, sessionID) => {
+        await context.data.session.message.sync(sessionID).catch(() => {});
+        return newestAssistantText(context.data.session.message.list(sessionID) ?? []);
+      },
+      isSubagent: (sessionID) => context.data.session.get(sessionID)?.parentID !== undefined,
+      // Direct children only (a grandchild reports to its own parent);
+      // mirrors the built-in notifications plugin.
+      hasRunningChild: (sessionID) =>
+        context.data.session
+          .family(sessionID)
+          .some(
+            (child) =>
+              child !== sessionID &&
+              context.data.session.get(child)?.parentID === sessionID &&
+              context.data.session.status(child) === "running",
+          ),
+      isSessionTabActive: (sessionID) => {
+        const tabs = context.ui?.tabs;
+        if (!tabs?.enabled?.()) return undefined;
+        const root = context.data.session.root(sessionID);
+        const tab = tabs.list().find((item) => item.sessionID === root);
+        if (!tab) return undefined;
+        return tab.active === true;
+      },
+      // This TUI's own location, read live per event: with the shared server,
+      // only events from this directory are signalled by this instance, and
+      // the location changes when a session from another directory is opened
+      // or moved.
+      locationDirectory: () => context.location?.directory,
+    });
+    await run(
+      {
+        ...api,
+        lifecycle: { onDispose: (dispose) => disposers.push(dispose) },
+      },
+      context.options,
+    );
+    return () => {
+      api.event.dispose();
+      disposers.forEach((dispose) => dispose());
+    };
+  },
+});
