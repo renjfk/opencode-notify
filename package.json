@@ -34,6 +34,8 @@
     "fmt": "npx oxfmt --check .",
     "fmt:fix": "npx oxfmt --write .",
     "check": "npm run test && npm run lint && npm run fmt",
+    "e2e": "./e2e/run.sh",
+    "e2e:docker": "docker build -f e2e/Dockerfile -t opencode-notify-e2e . && docker run --rm -e E2E_ENDPOINT -e E2E_MODEL -e E2E_API_KEY_ENV -e E2E_PROVIDER_PACKAGE -e \"${E2E_API_KEY_ENV:-E2E_API_KEY}\" opencode-notify-e2e",
     "prepack": "npm run check"
   },
   "devDependencies": {

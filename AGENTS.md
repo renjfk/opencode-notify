@@ -18,9 +18,22 @@ Single TUI plugin exported from `index.js` with logic split into `lib/`.
 - Uses `node:child_process` (`execFile` only). Never `sh -c` with
   user-controlled strings (the lone exception, `hasBinary`, passes
   hardcoded binary names).
-- No dotfile I/O. All persistence goes through `api.kv`.
-- The location gate (`locationDirectory`) accepts a string or a function and
-  must be read per event: the TUI's location changes at runtime.
+- No dotfile I/O. All persistence goes through OpenCode's `storage.store`
+  (`api.kv` and the instance registry).
+- Routing between Zellij tabs uses the cross-instance registry in
+  `lib/ownership.js`, read per event: each TUI publishes the session its route
+  shows to a store shared by every instance, and exactly one instance owns a
+  session (the one showing it, else the live one that showed it last, else one
+  elected instance). Do not gate on the project directory or on
+  `ui.tabs.list()` - several tabs commonly share one launch directory, and the
+  session-tab strip is persisted per launch directory and shared by every
+  instance there, so either fires all of them.
+- Busy events record bookkeeping for every session but only settle signals
+  under strict ownership (`{ claim: false }`): a brand-new session goes busy
+  before its instance has published it.
+- Permission prompts and questions wait `REQUEST_GRACE_MS` before signalling
+  and are dropped if answered meanwhile: auto-accept (`--auto`) replies from
+  the TUI client, so the server still emits every request and its reply.
 - No build step. Plain ESM JavaScript, shipped as-is.
 - Listen to V2 execution events, not the deprecated V1 `session.idle` (in V2 it
   has no producer): `session.execution.started` is busy,
@@ -40,6 +53,13 @@ Tests are `node:test` files in `test/`, fully hermetic: capabilities and
 the TUI accept injected dependencies (fetch, exec, timers, mock `api`)
 instead of touching the network, the filesystem, or real timers.
 
+The e2e suite (`e2e/`) runs real OpenCode V2 TUIs in real Zellij tabs on one
+shared service against a real model, and asserts which tabs blink. Zellij
+scenarios are container-only (`npm run e2e:docker`). Run it after changing
+routing, ownership, or event handling; see `e2e/SKILL.md`. Machine-specific
+settings that must not be committed (the e2e endpoint, model, and key) live
+in `AGENTS.local.md` when present. Read it before running the e2e suite.
+
 ## Scripts
 
 ```bash
@@ -48,6 +68,8 @@ npm test             # node:test unit tests
 npm run lint         # oxlint .
 npm run fmt          # oxfmt --check .
 npm run fmt:fix      # oxfmt --write .
+npm run e2e:docker   # e2e suite in the container (needs E2E_* env, see e2e/README.md)
+npm run e2e          # e2e suite on the host (Zellij scenarios skip)
 ```
 
 Verify changes: `npm run check` with zero errors.

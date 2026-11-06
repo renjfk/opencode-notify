@@ -47,16 +47,23 @@ The tab blinking stops when:
 ### Multiple TUIs on the shared server (Zellij tabs)
 
 OpenCode v2 runs one shared server for every TUI instance, and every instance
-receives every event. Each instance signals only events whose project
-directory matches its own: when a session finishes in another Zellij tab
-(running a different project), that tab's instance blinks and notifies - the
-tab you are in stays quiet, and another tab going busy no longer clears this
+receives every event. Exactly one instance signals each session:
+
+1. the instance showing it;
+2. otherwise the instance that showed it last (a background session tab
+   signals in the Zellij tab where you last saw it);
+3. otherwise a single running instance, so a session no TUI has shown (for
+   example one started from the web app) still signals once.
+
+When a session finishes in another Zellij tab, that tab blinks and notifies,
+and the tab you are in stays quiet. Another tab going busy does not clear this
 tab's blink marker or notification.
 
-Events without a location, and instances whose directory is unknown, fall
-through unchanged. Two TUIs opened in the **same** directory both signal the
-same events: location cannot tell them apart, and staying quiet would risk
-nobody signalling at all.
+Routing deliberately does **not** use the project directory or the OpenCode
+session-tab strip: several Zellij tabs commonly share one launch directory,
+and the tab strip is shared by every TUI launched there, so either would fire
+every tab at once. Instead each TUI publishes the session it shows to a small
+store shared by all instances (OpenCode's plugin storage).
 
 ## Install
 
@@ -366,7 +373,11 @@ reports back to its parent rather than to you.
    terminal counts as not visible, so without ntfy a desktop notification is
    queued for unlock instead.
 
-Notifications are debounced to 2 seconds to avoid duplicates.
+Notifications are debounced to 2 seconds to avoid duplicates. Permission
+prompts and questions wait 1.5 seconds before signalling and stay quiet when
+they are answered within that window, so auto-accept mode (`opencode --auto`),
+which approves requests within milliseconds, does not blink, beep, or notify
+for every approved tool call.
 
 ## Contributing
 
@@ -391,6 +402,7 @@ npm test             # node:test unit tests
 npm run lint         # oxlint
 npm run fmt          # oxfmt --check
 npm run fmt:fix      # oxfmt --write
+npm run e2e:docker   # end-to-end suite: real TUIs in Zellij tabs (see e2e/README.md)
 ```
 
 ### Release process

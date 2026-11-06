@@ -33,13 +33,14 @@
 // detection, ntfy) is optional and probed at startup. Missing capabilities
 // are skipped gracefully and the plugin continues with whatever is available.
 //
-// With the V2 shared server every TUI instance receives every event, so each
-// instance signals only events whose location (project directory) matches its
-// own TUI: attention owed in another Zellij tab is that tab's instance's job.
-// Events without a location, or when the instance's own directory is unknown,
-// fall through unchanged. Two instances in the same directory both signal -
-// location cannot disambiguate them, and dropping the event would risk
-// nobody signalling at all.
+// With the V2 shared server every TUI instance receives every event, so
+// exactly one instance signals each session: the one displaying it, else the
+// one that displayed it last, else a single elected instance (see
+// lib/ownership.js). Attention owed in another Zellij tab is that tab's
+// instance's job. Neither the project directory nor the session-tab list can
+// decide this - several tabs commonly share one launch directory, and session
+// tabs are shared by every instance launched there - so instances publish
+// their displayed session to a store they all share.
 
 import { randomUUID } from "node:crypto";
 import { createPushCoalescer } from "./lib/coalesce.js";
@@ -48,6 +49,7 @@ import { createGhostty } from "./lib/ghostty.js";
 import { createLock } from "./lib/lock.js";
 import { createNotifier } from "./lib/notifier.js";
 import { createNtfy, normalizeMaxMessageBytes } from "./lib/ntfy.js";
+import { createOwnership } from "./lib/ownership.js";
 import { createSound } from "./lib/sound.js";
 import { getLastAgentText, getSessionTitle } from "./lib/session.js";
 import {
@@ -61,6 +63,11 @@ import {
 
 const DEBOUNCE_MS = 2000;
 const POLL_INTERVAL_MS = 1000;
+// Permission prompts and questions answered within this window never signal.
+// Auto-accept (`--auto`) replies from the TUI client, so the server still
+// emits every request and its reply, milliseconds apart.
+const REQUEST_GRACE_MS = 1500;
+const REQUEST_EVENTS = new Set(["permission.asked", "question.asked"]);
 
 // The V2 TUI runtime injects `@opencode/plugin/tui`. Fall back to the identity
 // contract when the module is unavailable (plain `node --test` without the
@@ -140,15 +147,21 @@ export function createTui(dependencies = {}) {
     // session is still running. A child's completion re-wakes the parent, so
     // the parent's own completion is not the end of the turn yet.
     hasRunningChild = () => false,
-    // Directory of the location this TUI instance runs in, when known: a
-    // string or a function returning one (read per event, because the TUI's
-    // location changes when a session from another directory is opened or
-    // moved). The V2 shared server broadcasts every event to every connected
-    // TUI, so events carrying a different directory belong to another
-    // instance (another Zellij tab, another project) and are ignored.
-    // Undefined, or an event without a location, falls through: single-instance
-    // setups and tests keep the previous behavior.
-    locationDirectory = undefined,
+    // True when this TUI instance owns the event's session, false when
+    // another instance does (another Zellij tab). Read per event, because
+    // ownership follows the route of every instance. The V2 shared server
+    // broadcasts every event to every connected TUI, so a session this
+    // instance does not own is ignored. `{ claim: false }` asks for strict
+    // ownership (displayed or last viewed here, no election). `undefined`
+    // means ownership cannot be determined: the event then falls through
+    // unchanged (single-instance setups and tests keep the previous
+    // behavior).
+    ownsSession = () => undefined,
+    // How long a permission prompt or question waits for an answer before
+    // it signals. Signalling a request auto-accept already answered is
+    // noise, and it would also use up the notification debounce the real
+    // completion signal needs. 0 signals immediately.
+    requestGraceMs = REQUEST_GRACE_MS,
   } = dependencies;
 
   return async (api, options) => {
@@ -300,14 +313,14 @@ export function createTui(dependencies = {}) {
       return busyEpochs.get(sessionID) ?? 0;
     }
 
-    // True when the event belongs to a different location: another TUI
-    // instance sharing the server owns it and does the signalling. The own
-    // directory is resolved per event so a changed TUI location (open dialog,
-    // /cd, a session moved to a worktree) takes effect immediately.
-    function isForeignLocation(event) {
-      const own = typeof locationDirectory === "function" ? locationDirectory() : locationDirectory;
-      const eventDirectory = event.location?.directory;
-      return own !== undefined && eventDirectory !== undefined && eventDirectory !== own;
+    // True when the event belongs to a session another TUI instance sharing
+    // the server owns: that instance does the signalling. Ownership is
+    // resolved per event so switching tabs or opening another session takes
+    // effect immediately.
+    function isForeignSession(event, options) {
+      const sessionID = event.properties?.sessionID;
+      if (sessionID === undefined) return false;
+      return ownsSession(sessionID, options) === false;
     }
 
     function stopGhosttyPoll() {
@@ -444,42 +457,71 @@ export function createTui(dependencies = {}) {
       return request;
     }
 
-    // Requests answered or dismissed in the TUI (or by our own reply) drop
-    // out of the reply channel; a session going busy settles its requests.
+    // Requests still inside their grace window: requestID -> { timer, sessionID }.
+    const pendingRequests = new Map();
+
+    function cancelPendingRequest(requestID) {
+      const pending = pendingRequests.get(requestID);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingRequests.delete(requestID);
+    }
+
+    // An execution that ended no longer waits on any of its requests.
+    function cancelPendingRequests(sessionID) {
+      for (const [requestID, pending] of pendingRequests) {
+        if (pending.sessionID === sessionID) cancelPendingRequest(requestID);
+      }
+    }
+
+    // Requests answered or dismissed in the TUI (or by our own reply, or by
+    // auto-accept) never signal if still pending, and drop out of the reply
+    // channel; a session going busy settles its requests.
+    function settleRequest(event) {
+      const requestID = event.properties?.requestID;
+      cancelPendingRequest(requestID);
+      broker?.resolve(requestID);
+    }
+
     let disposed = false;
-    api.event.on("permission.replied", (event) => broker?.resolve(event.properties?.requestID));
-    api.event.on("question.replied", (event) => broker?.resolve(event.properties?.requestID));
-    api.event.on("question.rejected", (event) => broker?.resolve(event.properties?.requestID));
+    api.event.on("permission.replied", settleRequest);
+    api.event.on("question.replied", settleRequest);
+    api.event.on("question.rejected", settleRequest);
     api.lifecycle?.onDispose?.(() => {
       disposed = true;
+      for (const { timer } of pendingRequests.values()) clearTimeout(timer);
+      pendingRequests.clear();
       pushes.stop();
       broker?.stop();
     });
 
-    async function markBusy(sessionID) {
+    async function markBusy(event) {
+      const sessionID = event.properties?.sessionID;
       // A subagent going busy must not stop the parent's blink marker or clear
       // its notification, and it never signals on completion either.
       if (isSubagent(sessionID)) return;
+      // Bookkeeping runs for every session: ownership is decided when the
+      // session needs attention, by which time every instance has published
+      // its route. Deciding it here instead would race a brand-new session
+      // whose instance has not published it yet.
       busyEpochs.set(sessionID, epochOf(sessionID) + 1);
       busySessions.add(sessionID);
       broker?.clearSession(sessionID);
+      // Another tab's session going busy must not stop this tab's blink
+      // marker or clear its pending notification. Strict ownership: only the
+      // tab showing the session (or the one that last showed it) settles it.
+      if (isForeignSession(event, { claim: false })) return;
       stopGhosttyPoll();
       await zellij.stopBlinking();
       if (notifier.available) await notifier.clear();
     }
 
     // `session.execution.started` is the live V2 busy signal; the legacy
-    // `session.status` busy event is kept as a secondary source. Both are
-    // gated on location: another tab's session going busy must not stop this
-    // tab's blink marker or clear its pending notification.
-    api.event.on("session.execution.started", async (event) => {
-      if (isForeignLocation(event)) return;
-      await markBusy(event.properties?.sessionID);
-    });
+    // `session.status` busy event is kept as a secondary source.
+    api.event.on("session.execution.started", markBusy);
     api.event.on("session.status", async (event) => {
       if (event.properties?.status?.type !== "busy") return;
-      if (isForeignLocation(event)) return;
-      await markBusy(event.properties?.sessionID);
+      await markBusy(event);
     });
 
     async function handleAttention(event) {
@@ -593,16 +635,38 @@ export function createTui(dependencies = {}) {
       }
     }
 
+    async function signal(event) {
+      // Another tab's attention is that tab's instance's job; without this
+      // gate every Zellij tab would signal every session's events.
+      if (isForeignSession(event)) return;
+      try {
+        await handleAttention(event);
+      } catch (err) {
+        toast(`Notify error: ${err.message}`, "error");
+      }
+    }
+
     for (const [eventName, type] of ATTENTION_EVENTS) {
       api.event.on(eventName, async (event) => {
-        // Another location's attention is that tab's instance's job; without
-        // this gate every Zellij tab would signal every session's events.
-        if (isForeignLocation(event)) return;
-        try {
-          await handleAttention({ ...event, type });
-        } catch (err) {
-          toast(`Notify error: ${err.message}`, "error");
+        const attention = { ...event, type };
+        const requestID = REQUEST_EVENTS.has(type) ? event.properties?.id : undefined;
+        if (requestID === undefined) {
+          cancelPendingRequests(event.properties?.sessionID);
+          await signal(attention);
+          return;
         }
+        if (requestGraceMs <= 0) {
+          await signal(attention);
+          return;
+        }
+        // Wait for a quick answer (auto-accept, another client) before
+        // signalling; the reply cancels the pending signal.
+        cancelPendingRequest(requestID);
+        const timer = setTimeout(() => {
+          pendingRequests.delete(requestID);
+          if (!disposed) void signal(attention);
+        }, requestGraceMs);
+        pendingRequests.set(requestID, { timer, sessionID: event.properties?.sessionID });
       });
     }
   };
@@ -849,11 +913,33 @@ export function createLegacyApi(context) {
   };
 }
 
+// Root session this TUI instance is showing, or undefined (home screen, a
+// plugin page). This is the only per-instance view state: the session-tab
+// list is persisted per launch directory and shared by every instance.
+export function displayedSession(context) {
+  const route = context.ui?.router?.current?.();
+  if (route?.type !== "session" || !route.sessionID) return undefined;
+  return context.data.session.root(route.sessionID);
+}
+
+// Session ownership across the TUI instances sharing the server, or null
+// when this host has no shared storage (ownership then falls through).
+export function createInstanceOwnership(context, options = {}) {
+  if (typeof context.storage?.store !== "function") return null;
+  return createOwnership({
+    root: (sessionID) => context.data.session.root(sessionID),
+    current: () => displayedSession(context),
+    store: context.storage.store("instances", { initial: { instances: {}, viewers: {} } }),
+    ...options,
+  });
+}
+
 export default Plugin.define({
   id: "opencode-notify",
   async setup(context) {
     const disposers = [];
     const api = createLegacyApi(context);
+    const ownership = createInstanceOwnership(context);
     const run = createTui({
       getSessionTitle: async (_client, sessionID) =>
         context.data.session.get(sessionID)?.title || "",
@@ -881,11 +967,9 @@ export default Plugin.define({
         if (!tab) return undefined;
         return tab.active === true;
       },
-      // This TUI's own location, read live per event: with the shared server,
-      // only events from this directory are signalled by this instance, and
-      // the location changes when a session from another directory is opened
-      // or moved.
-      locationDirectory: () => context.location?.directory,
+      // With the shared server every instance receives every event; the
+      // registry decides which one signals (see lib/ownership.js).
+      ownsSession: (sessionID, options) => ownership?.owns(sessionID, options),
     });
     await run(
       {
@@ -897,6 +981,7 @@ export default Plugin.define({
     return () => {
       api.event.dispose();
       disposers.forEach((dispose) => dispose());
+      void ownership?.dispose();
     };
   },
 });

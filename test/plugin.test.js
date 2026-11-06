@@ -16,44 +16,25 @@ test("does nothing when the tab and terminal are visible", async () => {
   assert.equal(fixture.sound.playCount, 0);
 });
 
-test("ignores attention events from another location", async () => {
+test("ignores attention events for a session it does not own", async () => {
   const fixture = await createFixture({
     tabActive: false,
     ghosttyVisible: false,
-    locationDirectory: "/tabs/one",
+    ownsSession: () => false,
   });
 
-  await fixture.emit("permission.asked", {
-    properties: { sessionID: "session-1" },
-    location: { directory: "/tabs/two" },
-  });
+  await fixture.emit("permission.asked", { properties: { sessionID: "session-1" } });
 
   assert.equal(fixture.zellij.startCount, 0);
   assert.equal(fixture.notifier.calls.length, 0);
   assert.equal(fixture.sound.playCount, 0);
 });
 
-test("signals attention events from its own location", async () => {
+test("signals attention events for a session it owns", async () => {
   const fixture = await createFixture({
     tabActive: false,
     ghosttyVisible: false,
-    locationDirectory: "/tabs/one",
-  });
-
-  await fixture.emit("permission.asked", {
-    properties: { sessionID: "session-1" },
-    location: { directory: "/tabs/one" },
-  });
-
-  assert.equal(fixture.zellij.startCount, 1);
-  assert.equal(fixture.notifier.calls.length, 1);
-});
-
-test("events without a location pass through unchanged", async () => {
-  const fixture = await createFixture({
-    tabActive: false,
-    ghosttyVisible: false,
-    locationDirectory: "/tabs/one",
+    ownsSession: () => true,
   });
 
   await fixture.emit("permission.asked", { properties: { sessionID: "session-1" } });
@@ -62,20 +43,30 @@ test("events without a location pass through unchanged", async () => {
   assert.equal(fixture.notifier.calls.length, 1);
 });
 
-test("a busy session in another location does not clear this tab's signals", async () => {
+test("sessions it cannot classify pass through unchanged", async () => {
   const fixture = await createFixture({
     tabActive: false,
     ghosttyVisible: false,
-    locationDirectory: "/tabs/one",
+  });
+
+  await fixture.emit("permission.asked", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.zellij.startCount, 1);
+  assert.equal(fixture.notifier.calls.length, 1);
+});
+
+test("a busy session it does not own does not clear this tab's signals", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    ownsSession: (sessionID) => sessionID === "session-1",
   });
 
   await fixture.emit("session.execution.started", {
     properties: { sessionID: "session-1" },
-    location: { directory: "/tabs/one" },
   });
   await fixture.emit("session.execution.succeeded", {
     properties: { sessionID: "session-1" },
-    location: { directory: "/tabs/one" },
   });
   assert.equal(fixture.zellij.startCount, 1);
   assert.equal(fixture.notifier.calls.length, 1);
@@ -88,10 +79,178 @@ test("a busy session in another location does not clear this tab's signals", asy
   // or clear its pending desktop notification.
   await fixture.emit("session.execution.started", {
     properties: { sessionID: "session-9" },
-    location: { directory: "/tabs/two" },
   });
   assert.equal(fixture.zellij.stopCount, stopCount);
   assert.equal(fixture.notifier.clearCount, clearCount);
+});
+
+test("a busy session owned only by election does not clear this tab's signals", async () => {
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    // Nobody shows session-9 and nobody showed it last; this instance is
+    // merely the elected one, so it is not where the user is working.
+    ownsSession: (sessionID, options) =>
+      sessionID === "session-1" || (sessionID === "session-9" && options?.claim !== false),
+  });
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
+  assert.equal(fixture.zellij.startCount, 1);
+  const stopCount = fixture.zellij.stopCount;
+  const clearCount = fixture.notifier.clearCount;
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-9" } });
+  assert.equal(fixture.zellij.stopCount, stopCount);
+  assert.equal(fixture.notifier.clearCount, clearCount);
+});
+
+test("a session owned only once it completes still signals", async () => {
+  // A brand-new session goes busy before its instance has published that it
+  // shows it; ownership is settled by the time the session completes.
+  let owned = false;
+  const fixture = await createFixture({
+    tabActive: false,
+    ghosttyVisible: false,
+    ownsSession: () => owned,
+  });
+
+  await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+  owned = true;
+  await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
+
+  assert.equal(fixture.zellij.startCount, 1);
+  assert.equal(fixture.notifier.calls.length, 1);
+});
+
+test("a permission auto-accepted within the grace window does not signal", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const fixture = await createFixture({
+      tabActive: false,
+      ghosttyVisible: true,
+      requestGraceMs: 1500,
+    });
+
+    await fixture.emit("permission.asked", {
+      properties: { id: "per_1", sessionID: "session-1", permission: "bash" },
+    });
+    // Auto-accept replies from the TUI client milliseconds later.
+    await fixture.emit("permission.replied", {
+      properties: { requestID: "per_1", sessionID: "session-1" },
+    });
+    mock.timers.tick(5000);
+    await flush();
+
+    assert.equal(fixture.zellij.startCount, 0);
+    assert.equal(fixture.sound.playCount, 0);
+    assert.equal(fixture.notifier.calls.length, 0);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a permission left unanswered signals once the grace window ends", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const fixture = await createFixture({
+      tabActive: false,
+      ghosttyVisible: false,
+      requestGraceMs: 1500,
+    });
+
+    await fixture.emit("permission.asked", {
+      properties: { id: "per_1", sessionID: "session-1", permission: "bash" },
+    });
+    mock.timers.tick(1000);
+    await flush();
+    assert.equal(fixture.zellij.startCount, 0);
+
+    mock.timers.tick(500);
+    await flush();
+    await flush();
+    assert.equal(fixture.zellij.startCount, 1);
+    assert.equal(fixture.notifier.calls[0].message, "Permission requested");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a question dismissed within the grace window does not signal", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const fixture = await createFixture({
+      tabActive: false,
+      ghosttyVisible: false,
+      requestGraceMs: 1500,
+    });
+
+    await fixture.emit("question.asked", {
+      properties: { id: "frm_1", sessionID: "session-1", questions: [] },
+    });
+    await fixture.emit("question.rejected", { properties: { requestID: "frm_1" } });
+    mock.timers.tick(5000);
+    await flush();
+
+    assert.equal(fixture.zellij.startCount, 0);
+    assert.equal(fixture.notifier.calls.length, 0);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("an auto-accepted permission does not swallow the completion signal", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const fixture = await createFixture({
+      tabActive: false,
+      ghosttyVisible: false,
+      requestGraceMs: 1500,
+    });
+
+    await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+    await fixture.emit("permission.asked", {
+      properties: { id: "per_1", sessionID: "session-1", permission: "bash" },
+    });
+    await fixture.emit("permission.replied", {
+      properties: { requestID: "per_1", sessionID: "session-1" },
+    });
+    // The task finishes well inside the notification debounce window.
+    await fixture.emit("session.execution.succeeded", { properties: { sessionID: "session-1" } });
+
+    assert.equal(fixture.notifier.calls.length, 1);
+    assert.equal(fixture.notifier.calls[0].message, "Task completed");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("an execution that ends drops its pending requests", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const fixture = await createFixture({
+      tabActive: false,
+      ghosttyVisible: false,
+      requestGraceMs: 1500,
+    });
+
+    await fixture.emit("session.execution.started", { properties: { sessionID: "session-1" } });
+    await fixture.emit("permission.asked", {
+      properties: { id: "per_1", sessionID: "session-1", permission: "bash" },
+    });
+    await fixture.emit("session.execution.interrupted", {
+      properties: { sessionID: "session-1", reason: "user" },
+    });
+    mock.timers.tick(5000);
+    await flush();
+
+    assert.deepEqual(
+      fixture.notifier.calls.map((call) => call.message),
+      ["Task completed"],
+    );
+  } finally {
+    mock.timers.reset();
+  }
 });
 
 test("blinks and plays sound for an inactive tab in a visible terminal", async () => {
@@ -195,28 +354,22 @@ test("a session completing while a background subagent runs does not signal yet"
   assert.equal(fixture.notifier.calls.length, 1);
 });
 
-test("the location gate reads a function-valued directory per event", async () => {
-  let own = "/tabs/one";
+test("the ownership gate is read per event", async () => {
+  let owned = false;
   const fixture = await createFixture({
     tabActive: false,
     ghosttyVisible: false,
-    locationDirectory: () => own,
+    ownsSession: () => owned,
   });
 
-  // Initially foreign: another instance owns /tabs/two.
-  await fixture.emit("permission.asked", {
-    properties: { sessionID: "session-1" },
-    location: { directory: "/tabs/two" },
-  });
+  // Another instance displays session-1 for now.
+  await fixture.emit("permission.asked", { properties: { sessionID: "session-1" } });
   assert.equal(fixture.notifier.calls.length, 0);
 
-  // The TUI opens a session from /tabs/two (open dialog, /cd, or a moved
-  // session): the same event directory is now this instance's own.
-  own = "/tabs/two";
-  await fixture.emit("permission.asked", {
-    properties: { sessionID: "session-1" },
-    location: { directory: "/tabs/two" },
-  });
+  // This instance opens session-1 (switch tab, open dialog): it now owns the
+  // same session and signals it.
+  owned = true;
+  await fixture.emit("permission.asked", { properties: { sessionID: "session-1" } });
   assert.equal(fixture.notifier.calls.length, 1);
 });
 
@@ -1234,7 +1387,8 @@ async function createFixture(
     hasRunningChild,
     sessionTabActive,
     selectResult,
-    locationDirectory,
+    ownsSession,
+    requestGraceMs = 0,
   } = {},
   options,
 ) {
@@ -1385,8 +1539,10 @@ async function createFixture(
     // undefined keeps the Zellij-only fallback; true/false exercise the
     // OpenCode session-tab integration.
     isSessionTabActive: () => sessionTabActive,
-    // The TUI instance's own directory; undefined disables location gating.
-    locationDirectory,
+    // Which sessions this instance owns; undefined disables the gate.
+    ownsSession,
+    // Requests signal immediately unless a test exercises the grace window.
+    requestGraceMs,
   });
   await tui(
     {

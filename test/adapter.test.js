@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { answersToForm, createLegacyApi, formToQuestion } from "../index.js";
+import {
+  answersToForm,
+  createInstanceOwnership,
+  createLegacyApi,
+  displayedSession,
+  formToQuestion,
+} from "../index.js";
 
 // A minimal V2 TUI plugin context: recorded data listeners, a state store,
 // and recorded client replies.
@@ -55,6 +61,81 @@ function fakeContext() {
 function emit(context, type, item) {
   for (const handler of context.listeners.get(type) ?? []) handler(item);
 }
+
+// A minimal context for the ownership adapter: root() maps children to a
+// parent, router.current() is the active route, and ui.tabs is the session
+// tab strip that every instance in one launch directory shares.
+function ownershipContext({ route, tabs = [], roots = {}, storage } = {}) {
+  return {
+    data: {
+      session: {
+        root: (sessionID) => roots[sessionID] ?? sessionID,
+      },
+    },
+    ui: {
+      router: { current: () => route },
+      tabs: {
+        enabled: () => true,
+        list: () => tabs,
+      },
+    },
+    storage,
+  };
+}
+
+// One store shared by several contexts, like `storage.store` live-synced
+// across TUI processes.
+function sharedStorage() {
+  const state = { instances: {}, viewers: {} };
+  return {
+    store: () => [
+      state,
+      async (mutation) => {
+        mutation(state);
+      },
+    ],
+  };
+}
+
+const manualTimers = { setInterval: () => ({}), clearInterval: () => {} };
+
+test("displayedSession is the root of the active session route", () => {
+  const route = { type: "session", sessionID: "ses_child" };
+  const context = ownershipContext({ route, roots: { ses_child: "ses_parent" } });
+  assert.equal(displayedSession(context), "ses_parent");
+});
+
+test("displayedSession is undefined off a session route", () => {
+  assert.equal(displayedSession(ownershipContext({ route: { type: "home" } })), undefined);
+  assert.equal(displayedSession(ownershipContext({})), undefined);
+});
+
+test("createInstanceOwnership is null without shared storage", () => {
+  assert.equal(createInstanceOwnership(ownershipContext({})), null);
+});
+
+test("an open background tab in a shared strip is not owned by every instance", async () => {
+  const storage = sharedStorage();
+  // Both instances run in one launch directory, so both see the same strip.
+  const tabs = [
+    { sessionID: "ses_1", active: false },
+    { sessionID: "ses_2", active: false },
+  ];
+  const one = createInstanceOwnership(
+    ownershipContext({ route: { type: "session", sessionID: "ses_1" }, tabs, storage }),
+    { id: "100", isAlive: () => true, ...manualTimers },
+  );
+  const two = createInstanceOwnership(
+    ownershipContext({ route: { type: "session", sessionID: "ses_2" }, tabs, storage }),
+    { id: "200", isAlive: () => true, ...manualTimers },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(one.owns("ses_1"), true);
+  assert.equal(two.owns("ses_1"), false);
+  assert.equal(one.owns("ses_2"), false);
+  assert.equal(two.owns("ses_2"), true);
+});
 
 test("formToQuestion prefers the field description as the question text", () => {
   const question = formToQuestion({

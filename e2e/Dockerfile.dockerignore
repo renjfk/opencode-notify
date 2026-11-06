@@ -1,0 +1,10 @@
+.git
+.github
+node_modules
+screenshots
+contrib
+test
+e2e/traces
+*.log
+*.tgz
+.DS_Store

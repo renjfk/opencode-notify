@@ -1,0 +1,12 @@
+# tui-test configuration for the opencode-notify e2e suite.
+# See https://github.com/microsoft/tui-test for all options.
+
+[profiles.default]
+scrollback = 10000
+
+[trace]
+mode = "on-failure"
+directory = "./traces"
+
+[diagnostics]
+screen-history-limit = 20
